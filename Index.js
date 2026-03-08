@@ -35,8 +35,8 @@ const WASM_URL = 'https://static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65dd
 let workerCache = null;
 let wasmCache = null;
 
-const EMAIL = process.env.DEEPSEEK_EMAIL || '';
-const PASSWORD = process.env.DEEPSEEK_PASSWORD || '';
+const EMAIL = "shannmoderz@gmail.com";
+const PASSWORD = "Dhaav100";
 
 let cachedToken = null;
 let tokenExpiry = 0;
