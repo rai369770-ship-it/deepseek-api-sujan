@@ -18,10 +18,10 @@ const upload = multer({ dest: os.tmpdir() });
 const CONFIG = {
     BASE_URL: "https://chat.deepseek.com/api/v0",
     HEADERS: {
-        'User-Agent': 'DeepSeek/1.6.4 Android/35',
+        'User-Agent': 'DeepSeek/2.0.3 Android/36',
         'Accept': 'application/json',
         'x-client-platform': 'android',
-        'x-client-version': '1.6.4',
+        'x-client-version': '2.0.3',
         'x-client-locale': 'id',
         'x-client-bundle-id': 'com.deepseek.chat',
         'x-rangers-id': '7392079989945982465',
