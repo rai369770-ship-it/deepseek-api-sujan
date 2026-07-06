@@ -12,7 +12,7 @@ const allowCors = fn => async (req, res) => {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'X-Requested-With, Content-Type, Accept, Authorization, X-Client-Version');
+    res.setHeader('Access-Control-Allow-Headers', 'X-Requested-With, Content-Type, Accept, Authorization');
     if (req.method === 'OPTIONS') return res.status(200).end();
     return await fn(req, res);
 };
@@ -43,127 +43,83 @@ const HEADERS = {
 };
 
 // ============================================================
-// NEW: WEB SESSION INITIALIZER (THE FIX)
-// DeepSeek's Load Balancer requires a 'ds_session_id' cookie 
-// to route requests to the API backend instead of the HTML frontend.
-// ============================================================
-let webCookies = null;
-
-async function initializeWebSession() {
-    if (webCookies) return webCookies;
-    
-    try {
-        // Hit the main page to generate and grab the routing cookies
-        const res = await fetch('https://chat.deepseek.com/', {
-            headers: { 'User-Agent': HEADERS['User-Agent'] }
-        });
-        
-        // Node.js 18+ native fetch parses Set-Cookie into an array
-        const setCookies = res.headers.getSetCookie(); 
-        if (setCookies && setCookies.length > 0) {
-            // Extract just the cookie names/values (ignore path/expiry attributes)
-            webCookies = setCookies.map(c => c.split(';')[0]).join('; ');
-        } else {
-            webCookies = ''; // Fallback if no cookies are set
-        }
-    } catch (e) {
-        console.error('Failed to initialize web session:', e.message);
-        webCookies = '';
-    }
-    
-    return webCookies;
-}
-
-// ============================================================
 // SAFE JSON FETCH WRAPPER
 // ============================================================
 async function fetchJSON(url, options) {
-    // Inject the routing cookies into EVERY API request
-    const cookies = await initializeWebSession();
-    options.headers = { ...options.headers, 'Cookie': cookies };
-
     const response = await fetch(url, options);
     const contentType = response.headers.get('content-type') || '';
     
+    // If it returns HTML, it means we hit a non-existent endpoint or got blocked
     if (!contentType.includes('application/json')) {
         const errorText = await response.text();
-        throw new Error(`CloudFront Block at ${url}. Status: ${response.status}. Body: ${errorText.substring(0, 200)}`);
+        throw new Error(`API Error at ${url}. Expected JSON, got HTML. Body: ${errorText.substring(0, 100)}`);
     }
     
     const data = await response.json();
     if (data.code !== 0 && data.code !== undefined) {
-        throw new Error(`DeepSeek API Error: ${data.msg || 'Unknown error'}`);
+        throw new Error(`DeepSeek Error: ${data.msg || 'Unknown API error'}`);
     }
     return data;
 }
 
 // ============================================================
-// 1. X-HIF-LEIM GENERATOR
+// 1. PROOF OF WORK SOLVER (Server-Side Challenge)
+// Uses the official API endpoint to get the challenge, 
+// then solves it using native SHA3-256 (No WASM needed)
 // ============================================================
-let cachedLeimKey = null;
-let leimKeyExpiry = 0;
-
-async function generateLeim(token, sessionId) {
-    if (cachedLeimKey && Date.now() < leimKeyExpiry) {
-        return encryptLeim(cachedLeimKey, sessionId);
-    }
-
-    const data = await fetchJSON(`${BASE_URL}/chat/leim_key`, {
-        method: 'GET',
-        headers: { ...HEADERS, 'Authorization': `Bearer ${token}` }
-    });
-
-    cachedLeimKey = data.data.biz_data.leim_key;
-    leimKeyExpiry = Date.now() + 600000;
-    return encryptLeim(cachedLeimKey, sessionId);
-}
-
-function encryptLeim(keyString, sessionId) {
-    const key = Buffer.from(keyString, 'utf-8');
-    const iv = Buffer.alloc(16, 0); 
-    const payload = JSON.stringify({ s: sessionId, t: Math.floor(Date.now() / 1000) });
+function solveChallenge(challengeData, targetPath) {
+    const { challenge, salt, difficulty } = challengeData;
+    const target = '0'.repeat(difficulty || 4);
     
-    const cipher = crypto.createCipheriv('aes-128-cbc', key, iv);
-    const encrypted = Buffer.concat([cipher.update(payload, 'utf8'), cipher.final()]);
-    return encrypted.toString('base64');
-}
-
-// ============================================================
-// 2. PROOF OF WORK SOLVER (SHA3-256)
-// ============================================================
-async function solvePow(targetPath) {
-    const chars = 'abcdef0123456789';
-    let salt = '';
-    for (let i = 0; i < 10; i++) salt += chars[Math.floor(Math.random() * chars.length)];
-    
-    const challenge = crypto.randomBytes(32).toString('hex');
-    const difficulty = 4;
-    const target = '0'.repeat(difficulty);
+    // Pre-compute challenge hash for HMAC signature
     const challengeHash = crypto.createHash('sha256').update(challenge).digest();
     let answer = 0;
 
     while (true) {
-        const hash = crypto.createHash('sha3-256').update(`${challenge}:${salt}:${answer}`).digest('hex');
+        // Native Node.js SHA3-256
+        const hash = crypto.createHash('sha3-256')
+            .update(`${challenge}:${salt}:${answer}`)
+            .digest('hex');
+
         if (hash.startsWith(target)) {
-            const signature = crypto.createHmac('sha256', challengeHash).update(`${challenge}:${salt}:${answer}:${targetPath}`).digest('hex');
-            return Buffer.from(JSON.stringify({ algorithm: "DeepSeekHashV1", challenge, salt, answer, signature, target_path: targetPath })).toString('base64');
+            // Create signature exactly like Web JS
+            const signature = crypto.createHmac('sha256', challengeHash)
+                .update(`${challenge}:${salt}:${answer}:${targetPath}`)
+                .digest('hex');
+
+            return Buffer.from(JSON.stringify({
+                algorithm: "DeepSeekHashV1",
+                challenge: challenge,
+                salt: salt,
+                answer: answer,
+                signature: signature,
+                target_path: targetPath
+            })).toString('base64');
         }
         answer++;
     }
 }
 
+async function getPowToken(token, targetPath) {
+    // Fetch the challenge directly from DeepSeek's server
+    const data = await fetchJSON(`${BASE_URL}/chat/create_pow_challenge`, {
+        method: 'POST',
+        headers: { ...HEADERS, 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ target_path: targetPath })
+    });
+    
+    const challengeData = data.data.biz_data.challenge;
+    return solveChallenge(challengeData, targetPath);
+}
+
 // ============================================================
-// 3. NON-STREAMING CHAT ACCUMULATOR
+// 2. NON-STREAMING CHAT ACCUMULATOR
 // ============================================================
 async function getFullResponse(token, sessionId, prompt, thinkingEnabled, searchEnabled) {
     const targetPath = '/api/v0/chat/completion';
     
-    // Execute crypto steps concurrently
-    const [powToken, hifLeim, cookies] = await Promise.all([
-        solvePow(targetPath),
-        generateLeim(token, sessionId),
-        initializeWebSession() // Grab cookies concurrently to save time
-    ]);
+    // Solve PoW (We removed X-Hif-Leim entirely as it's not strictly required)
+    const powToken = await getPowToken(token, targetPath);
 
     const payload = {
         chat_session_id: sessionId,
@@ -182,9 +138,8 @@ async function getFullResponse(token, sessionId, prompt, thinkingEnabled, search
         headers: {
             ...HEADERS,
             'Authorization': `Bearer ${token}`,
-            'Cookie': cookies, // INJECT COOKIES HERE
-            'x-ds-pow-response': powToken,
-            'X-Hif-Leim': hifLeim
+            'x-ds-pow-response': powToken
+            // Notice: NO X-Hif-Leim header here!
         },
         body: JSON.stringify(payload)
     });
@@ -218,11 +173,15 @@ async function getFullResponse(token, sessionId, prompt, thinkingEnabled, search
 
                     if (parsed.p && parsed.o) {
                         if (parsed.o === 'APPEND' && parsed.p.includes('content')) textToAdd = parsed.v;
-                        else if (parsed.o === 'BATCH' && Array.isArray(parsed.v)) for (const item of parsed.v) { if (item.o === 'APPEND' && item.p?.includes('content')) textToAdd += item.v; }
+                        else if (parsed.o === 'BATCH' && Array.isArray(parsed.v)) {
+                            for (const item of parsed.v) { if (item.o === 'APPEND' && item.p?.includes('content')) textToAdd += item.v; }
+                        }
                     } else if (parsed.v && typeof parsed.v === 'object') {
                         const ex = (o) => { if (['THINK','SEARCH','RESPONSE'].includes(o.type)) { fragmentType = o.type; return o.content||''; } if (Array.isArray(o.v)) return o.v.map(ex).join(''); return ''; };
                         textToAdd = ex(parsed.v);
-                    } else if (typeof parsed.v === 'string' && !['FINISHED','WIP'].includes(parsed.v)) { if (!parsed.p || parsed.p.includes('content')) textToAdd = parsed.v; }
+                    } else if (typeof parsed.v === 'string' && !['FINISHED','WIP'].includes(parsed.v)) { 
+                        if (!parsed.p || parsed.p.includes('content')) textToAdd = parsed.v; 
+                    }
 
                     if (fragmentType) currentFragment = fragmentType;
                     if (textToAdd) { if (currentFragment === 'THINK') thinkText += textToAdd; else fullText += textToAdd; }
@@ -234,7 +193,7 @@ async function getFullResponse(token, sessionId, prompt, thinkingEnabled, search
 }
 
 // ============================================================
-// 4. MAIN VERCEL HANDLER
+// 3. MAIN VERCEL HANDLER
 // ============================================================
 const handler = async (req, res) => {
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed. Use POST.' });
@@ -247,6 +206,7 @@ const handler = async (req, res) => {
 
     let sessionId = null;
     try {
+        // 1. Create Session
         const sessionData = await fetchJSON(`${BASE_URL}/chat_session/create`, {
             method: 'POST',
             headers: { ...HEADERS, 'Authorization': `Bearer ${token}` },
@@ -254,6 +214,7 @@ const handler = async (req, res) => {
         });
         sessionId = sessionData.data.biz_data.id;
 
+        // 2. Get Full Accumulated Response
         const result = await getFullResponse(token, sessionId, prompt, thinking_enabled === true, search_enabled === true);
         return res.status(200).json({ status: 'success', ...result });
 
@@ -261,9 +222,9 @@ const handler = async (req, res) => {
         console.error('Handler Error:', error.message);
         return res.status(500).json({ status: 'error', message: error.message });
     } finally {
+        // 3. ALWAYS cleanup session
         if (sessionId) {
-            const cookies = await initializeWebSession();
-            try { await fetch(`${BASE_URL}/chat_session/delete`, { method: 'POST', headers: { ...HEADERS, 'Authorization': `Bearer ${token}`, 'Cookie': cookies }, body: JSON.stringify({ chat_session_id: sessionId }) }); } catch(e){}
+            try { await fetch(`${BASE_URL}/chat_session/delete`, { method: 'POST', headers: { ...HEADERS, 'Authorization': `Bearer ${token}` }, body: JSON.stringify({ chat_session_id: sessionId }) }); } catch(e){}
         }
     }
 };
