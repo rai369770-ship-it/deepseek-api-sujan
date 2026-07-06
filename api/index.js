@@ -4,35 +4,24 @@ import crypto from 'crypto';
 // VERCEL CONFIG & CORS MIDDLEWARE
 // ============================================================
 export const config = {
-    // Increased timeout slightly to allow PoW solving + generation
     maxDuration: 15, 
-    api: {
-        bodyParser: {
-            sizeLimit: '2mb'
-        }
-    }
+    api: { bodyParser: { sizeLimit: '2mb' } }
 };
 
 const allowCors = fn => async (req, res) => {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Origin', '*'); // Allow all origins
+    res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    // Allow all necessary headers including Authorization
     res.setHeader('Access-Control-Allow-Headers', 'X-Requested-With, Content-Type, Accept, Authorization, X-Client-Version');
-    
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
+    if (req.method === 'OPTIONS') return res.status(200).end();
     return await fn(req, res);
 };
 
 // ============================================================
-// CONSTANTS & EXACT BROWSER HEADERS (CRITICAL FOR CLOUDFRONT)
+// CONSTANTS & EXACT BROWSER HEADERS
 // ============================================================
 const BASE_URL = 'https://chat.deepseek.com/api/v0';
 
-// These headers exactly mirror your Chrome network capture. 
-// Missing even one 'Sec-*' header causes CloudFront to throw an HTML error page.
 const HEADERS = {
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
@@ -54,10 +43,45 @@ const HEADERS = {
 };
 
 // ============================================================
+// NEW: WEB SESSION INITIALIZER (THE FIX)
+// DeepSeek's Load Balancer requires a 'ds_session_id' cookie 
+// to route requests to the API backend instead of the HTML frontend.
+// ============================================================
+let webCookies = null;
+
+async function initializeWebSession() {
+    if (webCookies) return webCookies;
+    
+    try {
+        // Hit the main page to generate and grab the routing cookies
+        const res = await fetch('https://chat.deepseek.com/', {
+            headers: { 'User-Agent': HEADERS['User-Agent'] }
+        });
+        
+        // Node.js 18+ native fetch parses Set-Cookie into an array
+        const setCookies = res.headers.getSetCookie(); 
+        if (setCookies && setCookies.length > 0) {
+            // Extract just the cookie names/values (ignore path/expiry attributes)
+            webCookies = setCookies.map(c => c.split(';')[0]).join('; ');
+        } else {
+            webCookies = ''; // Fallback if no cookies are set
+        }
+    } catch (e) {
+        console.error('Failed to initialize web session:', e.message);
+        webCookies = '';
+    }
+    
+    return webCookies;
+}
+
+// ============================================================
 // SAFE JSON FETCH WRAPPER
-// Prevents "Unexpected token '<'" crashes when CloudFront blocks us
 // ============================================================
 async function fetchJSON(url, options) {
+    // Inject the routing cookies into EVERY API request
+    const cookies = await initializeWebSession();
+    options.headers = { ...options.headers, 'Cookie': cookies };
+
     const response = await fetch(url, options);
     const contentType = response.headers.get('content-type') || '';
     
@@ -74,14 +98,12 @@ async function fetchJSON(url, options) {
 }
 
 // ============================================================
-// 1. X-HIF-LEIM GENERATOR (WEB JS LOGIC)
-// Fetches dynamic key, encrypts with AES-128-CBC, IV of 0x00
+// 1. X-HIF-LEIM GENERATOR
 // ============================================================
 let cachedLeimKey = null;
 let leimKeyExpiry = 0;
 
 async function generateLeim(token, sessionId) {
-    // Cache key for 10 minutes to reduce API calls
     if (cachedLeimKey && Date.now() < leimKeyExpiry) {
         return encryptLeim(cachedLeimKey, sessionId);
     }
@@ -92,13 +114,13 @@ async function generateLeim(token, sessionId) {
     });
 
     cachedLeimKey = data.data.biz_data.leim_key;
-    leimKeyExpiry = Date.now() + 600000; // 10 mins
+    leimKeyExpiry = Date.now() + 600000;
     return encryptLeim(cachedLeimKey, sessionId);
 }
 
 function encryptLeim(keyString, sessionId) {
     const key = Buffer.from(keyString, 'utf-8');
-    const iv = Buffer.alloc(16, 0); // Web JS uses exactly 16 bytes of zeros
+    const iv = Buffer.alloc(16, 0); 
     const payload = JSON.stringify({ s: sessionId, t: Math.floor(Date.now() / 1000) });
     
     const cipher = crypto.createCipheriv('aes-128-cbc', key, iv);
@@ -107,8 +129,7 @@ function encryptLeim(keyString, sessionId) {
 }
 
 // ============================================================
-// 2. PROOF OF WORK SOLVER (WEB JS LOCAL GENERATION)
-// Generates challenge locally, solves SHA3-256, creates signature
+// 2. PROOF OF WORK SOLVER (SHA3-256)
 // ============================================================
 async function solvePow(targetPath) {
     const chars = 'abcdef0123456789';
@@ -118,49 +139,30 @@ async function solvePow(targetPath) {
     const challenge = crypto.randomBytes(32).toString('hex');
     const difficulty = 4;
     const target = '0'.repeat(difficulty);
-    
-    // Pre-compute challenge hash for the HMAC signature (matches Web Worker logic)
     const challengeHash = crypto.createHash('sha256').update(challenge).digest();
     let answer = 0;
 
-    // Brute force loop for SHA3-256
     while (true) {
-        const hash = crypto.createHash('sha3-256')
-            .update(`${challenge}:${salt}:${answer}`)
-            .digest('hex');
-
+        const hash = crypto.createHash('sha3-256').update(`${challenge}:${salt}:${answer}`).digest('hex');
         if (hash.startsWith(target)) {
-            // Generate HMAC-SHA256 signature exactly like the Web JS
-            const signature = crypto.createHmac('sha256', challengeHash)
-                .update(`${challenge}:${salt}:${answer}:${targetPath}`)
-                .digest('hex');
-
-            const payload = {
-                algorithm: "DeepSeekHashV1",
-                challenge: challenge,
-                salt: salt,
-                answer: answer,
-                signature: signature,
-                target_path: targetPath
-            };
-            
-            return Buffer.from(JSON.stringify(payload)).toString('base64');
+            const signature = crypto.createHmac('sha256', challengeHash).update(`${challenge}:${salt}:${answer}:${targetPath}`).digest('hex');
+            return Buffer.from(JSON.stringify({ algorithm: "DeepSeekHashV1", challenge, salt, answer, signature, target_path: targetPath })).toString('base64');
         }
         answer++;
     }
 }
 
 // ============================================================
-// 3. NON-STREAMING CHAT ACCUMULATOR (VERCEL COMPATIBLE)
-// Reads the SSE stream, parses Web JSON-Patches, accumulates text
+// 3. NON-STREAMING CHAT ACCUMULATOR
 // ============================================================
 async function getFullResponse(token, sessionId, prompt, thinkingEnabled, searchEnabled) {
     const targetPath = '/api/v0/chat/completion';
     
-    // Execute cryptographic steps concurrently to save time
-    const [powToken, hifLeim] = await Promise.all([
+    // Execute crypto steps concurrently
+    const [powToken, hifLeim, cookies] = await Promise.all([
         solvePow(targetPath),
-        generateLeim(token, sessionId)
+        generateLeim(token, sessionId),
+        initializeWebSession() // Grab cookies concurrently to save time
     ]);
 
     const payload = {
@@ -180,6 +182,7 @@ async function getFullResponse(token, sessionId, prompt, thinkingEnabled, search
         headers: {
             ...HEADERS,
             'Authorization': `Bearer ${token}`,
+            'Cookie': cookies, // INJECT COOKIES HERE
             'x-ds-pow-response': powToken,
             'X-Hif-Leim': hifLeim
         },
@@ -193,115 +196,57 @@ async function getFullResponse(token, sessionId, prompt, thinkingEnabled, search
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    
-    let buffer = '';
-    let fullText = '';
-    let thinkText = '';
-    let currentFragment = 'RESPONSE';
+    let buffer = '', fullText = '', thinkText = '', currentFragment = 'RESPONSE';
 
-    // Read stream chunk by chunk
     while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        
-        // SSE format separates events by double newlines
         const blocks = buffer.split('\n\n');
-        buffer = blocks.pop() || ''; // Keep incomplete chunk in buffer
+        buffer = blocks.pop() || '';
 
         for (const block of blocks) {
-            const lines = block.split('\n');
-            for (const line of lines) {
+            for (const line of block.split('\n')) {
                 if (!line.startsWith('data: ')) continue;
                 const dataStr = line.substring(6).trim();
                 if (!dataStr || dataStr === ':') continue;
 
                 try {
                     const parsed = JSON.parse(dataStr);
-                    let textToAdd = '';
-                    let fragmentType = null;
+                    let textToAdd = '', fragmentType = null;
 
-                    // Handle Web JSON-Patch format
                     if (parsed.p && parsed.o) {
-                        if (parsed.o === 'APPEND' && parsed.p.includes('content')) {
-                            textToAdd = parsed.v;
-                        } else if (parsed.o === 'BATCH' && Array.isArray(parsed.v)) {
-                            for (const item of parsed.v) {
-                                if (item.o === 'APPEND' && item.p?.includes('content')) {
-                                    textToAdd += item.v;
-                                }
-                            }
-                        }
-                    } 
-                    // Handle Initial Fragment Drops
-                    else if (parsed.v && typeof parsed.v === 'object') {
-                        const extractFragments = (obj) => {
-                            if (obj.type === 'THINK' || obj.type === 'SEARCH' || obj.type === 'RESPONSE') {
-                                fragmentType = obj.type;
-                                return obj.content || '';
-                            }
-                            if (Array.isArray(obj.v)) return obj.v.map(extractFragments).join('');
-                            return '';
-                        };
-                        textToAdd = extractFragments(parsed.v);
-                    } 
-                    // Handle Lazy String Chunks
-                    else if (typeof parsed.v === 'string' && !['FINISHED', 'WIP'].includes(parsed.v)) {
-                        if (!parsed.p || parsed.p.includes('content')) {
-                            textToAdd = parsed.v;
-                        }
-                    }
+                        if (parsed.o === 'APPEND' && parsed.p.includes('content')) textToAdd = parsed.v;
+                        else if (parsed.o === 'BATCH' && Array.isArray(parsed.v)) for (const item of parsed.v) { if (item.o === 'APPEND' && item.p?.includes('content')) textToAdd += item.v; }
+                    } else if (parsed.v && typeof parsed.v === 'object') {
+                        const ex = (o) => { if (['THINK','SEARCH','RESPONSE'].includes(o.type)) { fragmentType = o.type; return o.content||''; } if (Array.isArray(o.v)) return o.v.map(ex).join(''); return ''; };
+                        textToAdd = ex(parsed.v);
+                    } else if (typeof parsed.v === 'string' && !['FINISHED','WIP'].includes(parsed.v)) { if (!parsed.p || parsed.p.includes('content')) textToAdd = parsed.v; }
 
                     if (fragmentType) currentFragment = fragmentType;
-
-                    if (textToAdd) {
-                        if (currentFragment === 'THINK') {
-                            thinkText += textToAdd;
-                        } else {
-                            fullText += textToAdd;
-                        }
-                    }
-                } catch (e) {
-                    // Ignore malformed JSON chunks (e.g., [DONE] or incomplete objects)
-                }
+                    if (textToAdd) { if (currentFragment === 'THINK') thinkText += textToAdd; else fullText += textToAdd; }
+                } catch (e) {}
             }
         }
     }
-
-    return {
-        response: fullText.trim(),
-        thinking: thinkText.trim() || undefined
-    };
+    return { response: fullText.trim(), thinking: thinkText.trim() || undefined };
 }
 
 // ============================================================
 // 4. MAIN VERCEL HANDLER
 // ============================================================
 const handler = async (req, res) => {
-    // Only allow POST
-    if (req.method !== 'POST') {
-        return res.status(405).json({ error: 'Method Not Allowed. Use POST.' });
-    }
-
-    const { prompt, thinking_enabled, search_enabled } = req.body;
+    if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed. Use POST.' });
     
-    // Validate Authorization Header
+    const { prompt, thinking_enabled, search_enabled } = req.body;
     const authHeader = req.headers['authorization'];
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Missing or invalid Bearer Token in Authorization header.' });
-    }
+    if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing Bearer Token' });
     const token = authHeader.split(' ')[1];
-
-    // Validate Prompt
-    if (!prompt || typeof prompt !== 'string') {
-        return res.status(400).json({ error: 'Missing "prompt" parameter in JSON body.' });
-    }
+    if (!prompt) return res.status(400).json({ error: 'Missing "prompt" parameter' });
 
     let sessionId = null;
-
     try {
-        // Step 1: Create Chat Session
         const sessionData = await fetchJSON(`${BASE_URL}/chat_session/create`, {
             method: 'POST',
             headers: { ...HEADERS, 'Authorization': `Bearer ${token}` },
@@ -309,39 +254,16 @@ const handler = async (req, res) => {
         });
         sessionId = sessionData.data.biz_data.id;
 
-        // Step 2: Get Full Accumulated Response
-        const result = await getFullResponse(
-            token, 
-            sessionId, 
-            prompt, 
-            thinking_enabled === true, 
-            search_enabled === true
-        );
-
-        // Step 3: Return Success
-        return res.status(200).json({ 
-            status: 'success', 
-            ...result 
-        });
+        const result = await getFullResponse(token, sessionId, prompt, thinking_enabled === true, search_enabled === true);
+        return res.status(200).json({ status: 'success', ...result });
 
     } catch (error) {
         console.error('Handler Error:', error.message);
-        return res.status(500).json({ 
-            status: 'error', 
-            message: error.message 
-        });
+        return res.status(500).json({ status: 'error', message: error.message });
     } finally {
-        // Step 4: ALWAYS cleanup session to prevent ghost sessions on DeepSeek servers
         if (sessionId) {
-            try {
-                await fetch(`${BASE_URL}/chat_session/delete`, {
-                    method: 'POST',
-                    headers: { ...HEADERS, 'Authorization': `Bearer ${token}` },
-                    body: JSON.stringify({ chat_session_id: sessionId })
-                });
-            } catch (e) {
-                // Silently ignore cleanup errors
-            }
+            const cookies = await initializeWebSession();
+            try { await fetch(`${BASE_URL}/chat_session/delete`, { method: 'POST', headers: { ...HEADERS, 'Authorization': `Bearer ${token}`, 'Cookie': cookies }, body: JSON.stringify({ chat_session_id: sessionId }) }); } catch(e){}
         }
     }
 };
